@@ -15,6 +15,7 @@ import com.plovdev.bot.modules.beerjes.utils.BitUnixUtils;
 import com.plovdev.bot.modules.databases.UserEntity;
 import com.plovdev.bot.modules.models.SettingsService;
 import com.plovdev.bot.modules.models.TypeValueSwitcher;
+import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -108,7 +109,9 @@ public class BitUnixWS {
 
 
     private void checkOrderFill(String resp) {
-        OrderItem item = BitUnixUtils.parseInput(resp);
+        JSONObject jsonObject = new JSONObject(resp);
+        String data = jsonObject.getJSONObject("data").toString();
+        OrderItem item = BitUnixUtils.parseInput(data);
 
         TradeService ts = user.getUserBeerj();
         boolean isFeel = item.getOrderStatus().toLowerCase().contains("fill");
