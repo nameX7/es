@@ -15,17 +15,16 @@ import com.plovdev.bot.modules.beerjes.utils.BitUnixUtils;
 import com.plovdev.bot.modules.databases.UserEntity;
 import com.plovdev.bot.modules.models.SettingsService;
 import com.plovdev.bot.modules.models.TypeValueSwitcher;
-import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class BitUnixWS {
-    private final Map<String, PositionEvent> events = new ConcurrentHashMap<>();
-    private final Map<String, OrderEvent> orders = new ConcurrentHashMap<>();
+    private final Map<String, PositionEvent> events = new HashMap<>();
+    private final Map<String, OrderEvent> orders = new HashMap<>();
     private final TypeValueSwitcher<Boolean> isStopTrailing = new TypeValueSwitcher<>(false);
     private final SettingsService settings = new SettingsService();
 
@@ -109,52 +108,33 @@ public class BitUnixWS {
 
 
     private void checkOrderFill(String resp) {
-        try {
-            JSONObject jsonObject = new JSONObject(resp);
+        OrderItem item = BitUnixUtils.parseInput(resp);
 
-            if (!jsonObject.has("data") || !jsonObject.getJSONObject("data").isJSONObject()) {
-                log.warn("Incoming WebSocket message does not contain a valid 'data' object. Raw: {}", resp);
-                return;
-            }
+        TradeService ts = user.getUserBeerj();
+        boolean isFeel = item.getOrderStatus().toLowerCase().contains("fill");
+        boolean isClose = item.isReduceOnly();
+        log.info("position data params: pair: {}, status: {}, tSide: {}, isFeel: {}", symbol, item.getOrderStatus(), isClose ? "close" : "open", isFeel);
 
-            String data = jsonObject.getJSONObject("data").toString();
-            OrderItem item = BitUnixUtils.parseInput(data);
-
-            if (item == null || item.getOrderStatus() == null) {
-                log.error("Failed to parse OrderItem from data or order status is null. Data: {}", data);
-                return;
-            }
-
-            TradeService ts = user.getUserBeerj();
-            boolean isFill = item.getOrderStatus().toLowerCase().contains("fill");
-            boolean isClose = item.isReduceOnly();
-            log.info("BitUnix position data params: pair: {}, status: {}, isClose: {}, isFill: {}", symbol, item.getOrderStatus(), isClose, isFill);
-
-            // Логика для открытия позиции
-            if (isFill && !isClose) {
-                for (String s : events.keySet()) {
-                    if (s.equalsIgnoreCase(symbol)) {
-                        PositionEvent event = events.get(s);
-                        ts.getPositions(user).stream()
-                                .filter(p -> p.getSymbol().equalsIgnoreCase(symbol))
-                                .findFirst()
-                                .ifPresent(event::onPositionOpened);
+        if (isFeel && !isClose) {
+            for (String s : events.keySet()) {
+                if (s.equalsIgnoreCase(symbol)) {
+                    PositionEvent event = events.get(s);
+                    List<Position> positions = ts.getPositions(user).stream().filter(p -> p.getSymbol().equalsIgnoreCase(symbol)).toList();
+                    if (!positions.isEmpty()) {
+                        event.onPositionOpened(positions.getFirst());
                     }
                 }
             }
+        }
 
-            // Логика для обновления статуса ордера
-            if (isFill) {
-                Order order = getOrder(item, isClose);
-                for (String s : orders.keySet()) {
-                    if (s.equalsIgnoreCase(symbol)) {
-                        OrderEvent event = orders.get(s);
-                        event.onOrder(order);
-                    }
+        if (isFeel) {
+            Order input = getOrder(item, isClose);
+            for (String s : orders.keySet()) {
+                if (s.equalsIgnoreCase(symbol)) {
+                    OrderEvent event = orders.get(s);
+                    event.onOrder(input);
                 }
             }
-        } catch (Exception e) {
-            log.error("An unexpected error occurred while processing BitUnix order fill check. Raw response: {}", resp, e);
         }
     }
 
