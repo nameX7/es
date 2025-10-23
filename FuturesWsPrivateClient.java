@@ -188,46 +188,39 @@ public class FuturesWsPrivateClient {
      * Планирует переподключение с задержкой
      */
     private void scheduleReconnect() {
-        if (!reconnecting.compareAndSet(false, true)) {
-            log.info("Reconnection already in progress");
-            return; // Уже в процессе реконнекта
+        if (reconnecting.getAndSet(true)) {
+            log.info("Reconnection attempt already in progress for BitUnix.");
+            return;
         }
 
-        log.info("Scheduling reconnection in 5 seconds...");
-
-        // Останавливаем предыдущий планировщик реконнекта
         if (reconnectExecutor != null) {
             reconnectExecutor.shutdownNow();
         }
-
         reconnectExecutor = Executors.newSingleThreadScheduledExecutor();
-        reconnectExecutor.schedule(() -> {
-            try {
-                log.info("Attempting to reconnect...");
-                reconnecting.set(false);
-                reconnect();
-            } catch (Exception e) {
-                log.error("Reconnection attempt failed", e);
-                reconnecting.set(false);
-                // Планируем следующую попытку через 10 секунд
-                scheduleDelayedReconnect(0);
+
+        // Инициализация для цикла Exponential Backoff
+        reconnectExecutor.schedule(new Runnable() {
+            private long delay = 1000; // Начать с 1 секунды
+            private final long maxDelay = 60000; // Максимальная задержка 60 секунд
+
+            @Override
+            public void run() {
+                if (!active.get()) {
+                    try {
+                        log.info("Attempting to reconnect to BitUnix WebSocket... (Next attempt in {}ms)", delay);
+                        reconnect(); // reconnect() теперь просто пытается пересоздать сокет
+                    } catch (Exception e) {
+                        log.warn("Reconnect attempt for BitUnix failed.", e);
+                    }
+
+                    // Планируем следующую попытку с увеличенной задержкой
+                    delay = Math.min(delay * 2, maxDelay);
+                    reconnectExecutor.schedule(this, delay, TimeUnit.MILLISECONDS);
+                } else {
+                    reconnecting.set(false); // Соединение установлено, сбрасываем флаг
+                }
             }
-        }, 0, TimeUnit.SECONDS);
-    }
-
-    /**
-     * Планирует переподключение с указанной задержкой
-     */
-    private void scheduleDelayedReconnect(int delaySeconds) {
-        if (reconnectExecutor != null) {
-            reconnectExecutor.shutdownNow();
-        }
-
-        reconnectExecutor = Executors.newSingleThreadScheduledExecutor();
-        reconnectExecutor.schedule(() -> {
-            reconnecting.set(false);
-            reconnect();
-        }, delaySeconds, TimeUnit.SECONDS);
+        }, 1000, TimeUnit.MILLISECONDS); // Начать первую попытку через 1 секунду
     }
 
     /**

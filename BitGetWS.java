@@ -21,12 +21,16 @@ import org.slf4j.LoggerFactory;
 
 import java.math.BigDecimal;
 import java.net.URI;
-import java.util.*;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.Timer;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class BitGetWS extends WebSocketClient {
     private static final Logger log = LoggerFactory.getLogger(BitGetWS.class);
-    private final Map<String, PositionEvent> events = new HashMap<>();
-    private final Map<String, OrderEvent> orders = new HashMap<>();
+    private final Map<String, PositionEvent> events = new ConcurrentHashMap<>();
+    private final Map<String, OrderEvent> orders = new ConcurrentHashMap<>();
 
     private final Gson gson = new Gson();
     private final String apiKey;
@@ -280,32 +284,39 @@ public class BitGetWS extends WebSocketClient {
      */
     @Override
     public void reconnect() {
-        new Thread(() -> {
-            isReconnecting = true;
-            try {
-                System.out.println("Attempting to reconnect...");
+        if (isReconnecting) {
+            return; // Already in the process of reconnecting
+        }
+        isReconnecting = true;
 
-                if (reconnectBlocking()) {
-                    log.info("Reconnection successful");
-                    synchronized (connectionLock) {
-                        isConnected = true;
-                        connectionLock.notifyAll();
+        Thread.startVirtualThread(() -> {
+            long delay = 1000; // Start with 1 second
+            final long maxDelay = 60000; // Max delay of 60 seconds
+
+            while (true) {
+                try {
+                    log.info("Attempting to reconnect to BitGet WebSocket... (Next attempt in {}ms)", delay);
+                    if (reconnectBlocking()) {
+                        log.info("Reconnection to BitGet WebSocket successful!");
+                        // isConnected and isAuthenticated will be set in onOpen and handleEventMessage
+                        return; // Exit the loop on success
                     }
-
-
-                    // Повторная аутентификация
-                    authenticate();
-                    waitForAuthentication();
-                    sendPong();
-
-                    subscribeToChannels();
+                } catch (Exception e) {
+                    log.warn("reconnectBlocking() failed for BitGet WebSocket", e);
                 }
-            } catch (Exception e) {
-                log.error("Reconnection failed: ", e);
-            } finally {
-                isReconnecting = false;
+
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.error("Reconnect thread was interrupted.", e);
+                    return;
+                }
+
+                // Exponential backoff
+                delay = Math.min(delay * 2, maxDelay);
             }
-        }).start();
+        });
     }
 
     private void authenticate() {
@@ -405,23 +416,44 @@ public class BitGetWS extends WebSocketClient {
     }
 
     private void notifyPositionListeners(JsonObject object) {
-        log.info("Get position event");
+        log.debug("Checking for position open event in data: {}", object);
+
+        if (!object.has("data") || !object.get("data").isJsonArray() || object.getAsJsonArray("data").isEmpty()) {
+            return; // No data, nothing to process
+        }
         JsonArray data = object.getAsJsonArray("data");
-        JsonObject order = data.get(0).getAsJsonObject();
+        JsonObject orderJson = data.get(0).getAsJsonObject();
 
-        String pair = order.get("instId").getAsString().replace("_UMCBL", "");
-        String status = order.get("status").getAsString();
-        String tSide = order.get("tS").getAsString();
-        boolean isFeel = status.contains("fill") && tSide.contains("open");
-        log.info("position data params: pair: {}, status: {}, tSide: {}, isFeel: {}", pair, status, tSide, isFeel);
+        try {
+            if (!orderJson.has("status") || !orderJson.has("tS") || !orderJson.has("instId")) {
+                log.warn("Position data is missing critical fields ('status', 'tS', 'instId'). Cannot determine position state.");
+                return;
+            }
 
-        if (isFeel) {
-            for (String s : events.keySet()) {
-                if (s.equalsIgnoreCase(pair)) {
-                    PositionEvent event = events.get(s);
-                    event.onPositionOpened(ts.getPositions(user).stream().filter(p -> p.getSymbol().equalsIgnoreCase(pair)).toList().getFirst());
+            String status = orderJson.get("status").getAsString();
+            String tSide = orderJson.get("tS").getAsString(); // e.g., "open_long", "close_short"
+
+            // Позиция считается открытой только при полном исполнении ордера на открытие
+            boolean isFill = status.toLowerCase().contains("fill");
+            boolean isOpen = tSide.toLowerCase().startsWith("open");
+
+            if (isFill && isOpen) {
+                String pair = orderJson.get("instId").getAsString().replace("_UMCBL", "");
+                log.info("Position open condition met for pair '{}'. Status: {}, Trade Side: {}", pair, status, tSide);
+
+                for (String s : events.keySet()) {
+                    if (s.equalsIgnoreCase(pair)) {
+                        PositionEvent event = events.get(s);
+                        // Запрашиваем актуальную информацию о позиции через REST API для надежности
+                        ts.getPositions(user).stream()
+                                .filter(p -> p.getSymbol().equalsIgnoreCase(pair))
+                                .findFirst() // Используем findFirst для безопасности
+                                .ifPresent(event::onPositionOpened);
+                    }
                 }
             }
+        } catch (Exception e) {
+            log.error("Failed to process position notification. Raw data: {}", orderJson, e);
         }
     }
 
@@ -430,48 +462,97 @@ public class BitGetWS extends WebSocketClient {
     }
 
     private void notifyOrderListeners(JsonObject object) {
-        log.info("Get order event");
+        log.info("Received order event data: {}", object);
+
+        if (!object.has("data") || !object.get("data").isJsonArray() || object.getAsJsonArray("data").isEmpty()) {
+            log.warn("Order event is missing 'data' array or it is empty.");
+            return;
+        }
         JsonArray data = object.getAsJsonArray("data");
-        JsonObject order = data.get(0).getAsJsonObject();
+        JsonObject orderJson = data.get(0).getAsJsonObject();
 
-        String pair = order.get("instId").getAsString().replace("_UMCBL", "");
-        String status = order.get("status").getAsString();
-        String id = order.get("ordId").getAsString();
-        String tradeSide = order.get("tS").getAsString();
-        String side = tradeSide.substring(0, tradeSide.indexOf('_'));
-        String posSide = tradeSide.substring(tradeSide.indexOf('_')+1);
+        try {
+            // --- Безопасное извлечение и проверка обязательных полей ---
+            if (!orderJson.has("instId") || !orderJson.has("status") || !orderJson.has("ordId") || !orderJson.has("tS")) {
+                log.error("Critical order data is missing in the JSON object: {}", orderJson);
+                return;
+            }
 
-        boolean isFeel = status.equals("full-fill") || status.equals("triggered");
+            String pair = orderJson.get("instId").getAsString().replace("_UMCBL", "");
+            String status = orderJson.get("status").getAsString();
+            String id = orderJson.get("ordId").getAsString();
+            String tradeInfo = orderJson.get("tS").getAsString();
 
-        log.info("order data params: pair: {}, status: {}, id: {}, side: {}, isFeel: {}", pair, status, id, side, isFeel);
-        Order input = new Order();
-        input.setOrderId(id);
-        input.setSymbol(pair);
-        input.setPrice(new BigDecimal(order.get("px").getAsString()));
-        input.setSize(new BigDecimal(order.get("sz").getAsString()));
-        input.setOrderType(order.get("ordType").getAsString());
-        input.setStopTraling(false);
+            // --- Безопасный парсинг tradeInfo ---
+            String side, posSide;
+            if (tradeInfo.contains("_")) {
+                side = tradeInfo.substring(0, tradeInfo.indexOf('_'));
+                posSide = tradeInfo.substring(tradeInfo.indexOf('_') + 1);
+            } else {
+                log.warn("Cannot determine trade side and position side from 'tS' field: {}", tradeInfo);
+                side = "unknown";
+                posSide = "unknown";
+            }
 
-        String ps = order.get("posSide").getAsString().toLowerCase();
-        input.setPosSide(ps.equals("buy") || ps.equals("long")? "LONG" : "SHORT");
-        input.setSide(order.get("side").getAsString());
-        input.setClient0Id(order.get("clOrdId").getAsString());
-        input.setFilledAmount(new BigDecimal(order.get("fillSz").getAsString()));
-        input.setState(status);
-        input.setOrderSource(order.get("eps").getAsString());
-        input.setTradeSide(side);
-        input.setMerginCoin("USDT");
-        input.setMarginMode(order.get("tdMode").getAsString());
-        input.setLeverage(Integer.parseInt(order.get("lever").getAsString()));
-        input.setHoldMode(order.get("hM").getAsString());
+            boolean isFill = status.equals("full-fill") || status.equals("triggered");
+            log.info("Parsed order data: pair: {}, status: {}, id: {}, side: {}, isFill: {}", pair, status, id, side, isFill);
 
-        if (isFeel) {
-            for (String s : orders.keySet()) {
-                if (s.equalsIgnoreCase(pair)) {
-                    OrderEvent event = orders.get(s);
-                    event.onOrder(input);
+            // --- Создание и заполнение объекта Order с проверками ---
+            Order order = new Order();
+            order.setOrderId(id);
+            order.setSymbol(pair);
+            order.setState(status);
+            order.setTradeSide(side);
+            order.setMerginCoin("USDT"); // Assuming USDT
+            order.setStopTraling(false); // Default value
+
+            // --- Безопасное извлечение и преобразование опциональных полей ---
+            if (orderJson.has("px") && !orderJson.get("px").isJsonNull()) {
+                order.setPrice(new BigDecimal(orderJson.get("px").getAsString()));
+            }
+            if (orderJson.has("sz") && !orderJson.get("sz").isJsonNull()) {
+                order.setSize(new BigDecimal(orderJson.get("sz").getAsString()));
+            }
+            if (orderJson.has("ordType") && !orderJson.get("ordType").isJsonNull()) {
+                order.setOrderType(orderJson.get("ordType").getAsString());
+            }
+            if (orderJson.has("posSide") && !orderJson.get("posSide").isJsonNull()) {
+                String ps = orderJson.get("posSide").getAsString().toLowerCase();
+                order.setPosSide(ps.equals("buy") || ps.equals("long") ? "LONG" : "SHORT");
+            }
+            if (orderJson.has("side") && !orderJson.get("side").isJsonNull()) {
+                order.setSide(orderJson.get("side").getAsString());
+            }
+            if (orderJson.has("clOrdId") && !orderJson.get("clOrdId").isJsonNull()) {
+                order.setClient0Id(orderJson.get("clOrdId").getAsString());
+            }
+            if (orderJson.has("fillSz") && !orderJson.get("fillSz").isJsonNull()) {
+                order.setFilledAmount(new BigDecimal(orderJson.get("fillSz").getAsString()));
+            }
+            if (orderJson.has("eps") && !orderJson.get("eps").isJsonNull()) {
+                order.setOrderSource(orderJson.get("eps").getAsString());
+            }
+            if (orderJson.has("tdMode") && !orderJson.get("tdMode").isJsonNull()) {
+                order.setMarginMode(orderJson.get("tdMode").getAsString());
+            }
+            if (orderJson.has("lever") && !orderJson.get("lever").isJsonNull()) {
+                order.setLeverage(Integer.parseInt(orderJson.get("lever").getAsString()));
+            }
+            if (orderJson.has("hM") && !orderJson.get("hM").isJsonNull()) {
+                order.setHoldMode(orderJson.get("hM").getAsString());
+            }
+
+            // --- Уведомление слушателей ---
+            if (isFill) {
+                for (String s : orders.keySet()) {
+                    if (s.equalsIgnoreCase(pair)) {
+                        OrderEvent event = orders.get(s);
+                        event.onOrder(order);
+                    }
                 }
             }
+        } catch (Exception e) {
+            log.error("Failed to process order notification. Raw data: {}", orderJson, e);
         }
     }
 
