@@ -184,18 +184,8 @@ public class BitGetWS extends WebSocketClient {
 
         this.user = user;
 
-        Thread.startVirtualThread(() -> {
-            Timer ping = new Timer();
-            ping.scheduleAtFixedRate(new TimerTask() {
-                @Override
-                public void run() {
-                    sendPong();
-                }
-            }, 5000, 30000);
-        });
-
         // Добавляем таймаут подключения
-        this.setConnectionLostTimeout(36);
+        this.setConnectionLostTimeout(60);
     }
 
     @Override
@@ -489,8 +479,7 @@ public class BitGetWS extends WebSocketClient {
 
     private void sendPong() {
         if (isAuthenticated && isConnected) {
-            send("ping");
-            needToRestart = true;
+            send("pong");
         }
     }
 
